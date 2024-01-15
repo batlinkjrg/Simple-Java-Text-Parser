@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import javax.management.DescriptorKey;
 import javax.sound.sampled.Line;
@@ -31,11 +32,14 @@ public final class JavaTextParser {
     private int completeLinesProcessed = 0;
 
     // Statistics
-    private ConcurrentHashMap<String, ArrayList<StringLocation>> wordRecord;
+    private ConcurrentHashMap<String, Integer> wordRecord;
     private ConcurrentHashMap<Character, Integer> charRecord;
 
     private String mostUsedWord = null;
     private char mostUsedCharacter = '\0';
+
+    // For searching 
+    ArrayList<StringLocation> locations = null;
 
 
     // ****** / Constructors / ****** // // TODO: Add a constructor that takes in a string
@@ -167,14 +171,13 @@ public final class JavaTextParser {
 
     // ****** / Private Getters/Setters / ****** //
     // Add word to record
-    private synchronized void addWord_Stats(String word, StringLocation location) {
+    private synchronized void addWord_Stats(String word) {
         if( this.wordRecord.containsKey(word) ) {
-            this.wordRecord.get(word).add(location); // Add a key to the list of locations
+            int newCount = this.wordRecord.get(word) + 1;
+            this.wordRecord.put(word, newCount); // Add a key to the list of locations
         } else {
             // Create a new list of locations for this word
-            ArrayList<StringLocation> locations = new ArrayList<>();
-            locations.add(location);
-            this.wordRecord.put(word, locations);
+            this.wordRecord.put(word, 1);
         }
     }
 
@@ -194,6 +197,10 @@ public final class JavaTextParser {
         this.completeLinesProcessed++;
     }
 
+    // Add to arrayListSearch
+    private synchronized void addStringLocation_StringSearch(ArrayList<StringLocation> locationSet) {
+        this.locations.addAll(locationSet);
+    }
 
     // ****** / Getter Methods / ****** //
     public String getName() {
@@ -205,7 +212,7 @@ public final class JavaTextParser {
     }
 
     public int getWordCount(String word) {
-        return this.wordRecord.get(word).size();
+        return this.wordRecord.get(word);
     }
 
     public String getMostUsedWord() { 
@@ -222,8 +229,8 @@ public final class JavaTextParser {
         Enumeration<String> stringSet = this.wordRecord.keys();
         while( stringSet.hasMoreElements() ) {
             String currentString = stringSet.nextElement();
-            if(this.wordRecord.get(currentString).size() > mostOccurred) {
-                mostOccurred = this.wordRecord.get(currentString).size();
+            if(this.wordRecord.get(currentString) > mostOccurred) {
+                mostOccurred = this.wordRecord.get(currentString);
                 this.mostUsedWord = currentString;
             }
 
@@ -266,94 +273,124 @@ public final class JavaTextParser {
         return this.mostUsedCharacter;
     }
 
-    public StringSearchInfo searchForString(String string) {
-        // First see if the string on its own is in the word record
-        if(this.wordRecord.containsKey(string)) 
-            return new StringSearchInfo(
-                string.length(),
-                this.wordRecord.get( string ).toArray( new StringLocation[ this.wordRecord.get( string ).size() ] )
-                );
-        
+    public String[] searchForString_partialLine(String string, int surrounding) {
 
-        // Now see if it is a single word
-        if(LineProcessor.textLineWordCount( string) == 1 ) {
-            String[] words = LineProcessor.getWordsList(string);
-            ArrayList<String> keysFound = new ArrayList<>();
-            ArrayList<StringLocation> locationsFound = new ArrayList<>();
+        this.locations = new ArrayList<>();
+        ExecutorService searchingService = Executors.newFixedThreadPool(threadsAvailable/2);
 
-            // Search each key in the set for our word
-            this.wordRecord.keySet().forEach(key -> { 
-                for(String word : words)
-                    if(key.contains(word)) 
-                        keysFound.add(key);
+        // For each line, submit a searching task
+        buffered_text.forEach(line -> { 
+            searchingService.submit(new Runnable() {
+
+                @Override
+                public void run() {
+                    boolean isFound = LineProcessor.searchLine(string, line.lineText);
+                    if(isFound) {
+                        addStringLocation_StringSearch(LineProcessor.getStringLocations(string, line));
+                    }
+                }
+                
             });
+        });
 
-            // Check to see if we found anything!
-            if(keysFound.isEmpty()) 
-                return null;
-            
-
-            for( String key : keysFound ) {
-                locationsFound.addAll( this.wordRecord.get(key) );
-            }
-
-            return new StringSearchInfo(string.length(), locationsFound.toArray(new StringLocation[locationsFound.size()]) );
+        searchingService.shutdown();
+        System.out.println("Searching for text...");
+        try {
+            searchingService.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            System.err.println("Failed to await thread completion!!");
+            e.printStackTrace();
         }
 
-        // Otherwise now, we will assume it is phrase we are searching for
-        String[] wordsInPhrase = LineProcessor.getWordsList(string);
-        String leastUsedWord = null;
-        int leastUsedWordCount = Integer.MAX_VALUE;
-
-        for(int i = 0; i < wordsInPhrase.length; i++) {
-            String currentWord = wordsInPhrase[i];
-            if(!this.wordRecord.containsKey(currentWord)) { continue; }
-            int wordOccurrences = this.wordRecord.get(currentWord).size();
-            if(wordOccurrences < leastUsedWordCount) { leastUsedWordCount = wordOccurrences; leastUsedWord = currentWord; }
+        // Check to see if anything was found
+        if(this.locations.isEmpty()) {
+            this.locations = null;
+            return null;
         }
 
-        ArrayList<StringLocation> allowedLocations = this.wordRecord.get(leastUsedWord);
-        ArrayList<StringLocation> validLocations = new ArrayList<>();
-
-        for (StringLocation stringLocation : allowedLocations) {
-            int currentLine = stringLocation.LineNumber;
-
-            String line = buffered_text.get(currentLine-1).lineText;
-            
-            if(line.contains(string)) { validLocations.add(stringLocation); }
-        }
-
-        if(validLocations.isEmpty()) { return null; }
-
-        return new StringSearchInfo(string.length(), validLocations.toArray(new StringLocation[validLocations.size()]));
-    }
-
-    public String[] getTextFromLocations(StringSearchInfo searchInfo) {
         ArrayList<String> strings = new ArrayList<>();
-        for (StringLocation location : searchInfo.locationSet) {
-            String line = buffered_text.get(location.LineNumber-1).lineText;
-            int backAmount = 0;
-            while (backAmount < location.Column && backAmount < 6) {
-                backAmount++;
-            }
+        for (StringLocation stringLocation : this.locations) {
+            String line = buffered_text.get(stringLocation.LineNumber).lineText;
 
-            int forwardAmount = 0;
-            while ( forwardAmount < line.length()-searchInfo.stringLength && forwardAmount < 6 ) {
-                forwardAmount++;
-            }
+            // Set up parameter variables
+            int endParameter = 0;
+            int beginParameter = 0;
+            int beginIndex = stringLocation.Column-beginParameter;
+            int endIndex = stringLocation.Column+string.length()+endParameter;
 
-            String string = line.substring(location.Column-backAmount, searchInfo.stringLength+forwardAmount);
-            strings.add(string);
+            // Set beginning and end
+            while(endIndex < line.length() && endParameter < surrounding) {
+                endParameter++;
+                endIndex = stringLocation.Column+string.length()+endParameter;
+            }
+                
+            while(beginIndex > 0 && beginParameter < surrounding) {
+                beginParameter++;
+                beginIndex = stringLocation.Column-beginParameter;
+            }
+                
+            String stringOccurrence = line.substring(beginIndex, endIndex);
+
+            // Add dots ;)
+            if(beginIndex != 0) 
+                stringOccurrence = "..." + stringOccurrence;
+            
+
+            if(endIndex != line.length()) 
+                stringOccurrence = stringOccurrence + "...";
+            
+            strings.add(stringOccurrence);
         }
 
+        this.locations = null;
         return strings.toArray( new String[strings.size()] );
     }
 
-    public static void printStringArray(String[] stringArray) {
-        for (int i = 0; i < stringArray.length; i++) {
-            System.out.println("[Line Number " + i + "]: " + stringArray[i]);
+    public String[] searchForString_fullLine(String string) {
+        this.locations = new ArrayList<>();
+
+        ExecutorService searchingService = Executors.newFixedThreadPool(threadsAvailable/2);
+
+        // For each line, submit a searching task
+        buffered_text.forEach(line -> { 
+            searchingService.submit(new Runnable() {
+
+                @Override
+                public void run() {
+                    boolean isFound = LineProcessor.searchLine(string, line.lineText);
+                    if(isFound) {
+                        addStringLocation_StringSearch(LineProcessor.getStringLocations(string, line));
+                    }
+                }
+                
+            });
+        });
+
+        searchingService.shutdown();
+        System.out.println("Searching for text...");
+        try {
+            searchingService.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            System.err.println("Failed to await thread completion!!");
+            e.printStackTrace();
         }
+
+        // Check to see if anything was found
+        if(this.locations.isEmpty()) {
+            this.locations = null;
+            return null;
+        }
+
+        ArrayList<String> strings = new ArrayList<>();
+        for (StringLocation stringLocation : this.locations) {
+            String line = buffered_text.get(stringLocation.LineNumber).lineText;
+            strings.add(line);
+        }
+
+        this.locations = null;
+        return strings.toArray( new String[strings.size()] );
     }
+
 
     // ****** / Custom Data Types / ****** //
     // Used to record a line of text
@@ -367,18 +404,8 @@ public final class JavaTextParser {
         }
     }
 
-    public final class StringSearchInfo {
-        public StringLocation[] locationSet;
-        public int stringLength;
-
-        StringSearchInfo(int stringLength, StringLocation[] locations) {
-            this.stringLength = stringLength;
-            this.locationSet = locationSet;
-        }
-    }
-
     // Used to mark first character location in string
-    public final class StringLocation {
+    public final static class StringLocation {
         public int Column;
         public int LineNumber;
 
@@ -439,55 +466,38 @@ public final class JavaTextParser {
                 // Get the current word
                 if (lastIndex != BreakIterator.DONE && Character.isLetterOrDigit(line.lineText.charAt(firstIndex))) {
                     String word = line.lineText.substring(firstIndex, lastIndex);
-                    StringLocation wordLocation = new StringLocation(firstIndex, lineNumber+1); // plus 1 to line number because text files start at 1 not 0
-                    this.parser.addWord_Stats(word, wordLocation);
+                    this.parser.addWord_Stats(word);
                 }
             }
 
             this.parser.addProcessorCompleted();
         }
 
-        public static int textLineWordCount(String textLine) {
-            int wordCount = 0;
+        // Search Line
+        public static boolean searchLine(String string, String line) {
+            if(line.contains(string)) 
+                return true;
 
-            BreakIterator breakIterator = BreakIterator.getWordInstance();
-            breakIterator.setText(textLine);
-            int lastIndex = breakIterator.first();
-            while (BreakIterator.DONE != lastIndex) {
-                int firstIndex = lastIndex;
-                lastIndex = breakIterator.next();
-
-                // Get the current word
-                if (lastIndex != BreakIterator.DONE && Character.isLetterOrDigit(textLine.charAt(firstIndex))) {
-                    wordCount++;
-                }
-            }
-
-            return wordCount;
+            return false;
         }
 
-        // For convert a string to a list of words
-        public static String[] getWordsList(String string) {
-            ArrayList<String> wordsFound = new ArrayList<String>();
+        // Get word locations on line
+        public static ArrayList<StringLocation> getStringLocations(String string, TextLine text) {
+            String line = text.lineText;
+            ArrayList<StringLocation> locations = new ArrayList<>();
 
-            BreakIterator breakIterator = BreakIterator.getWordInstance();
-            breakIterator.setText(string);
-            int lastIndex = breakIterator.first();
-
-            while (BreakIterator.DONE != lastIndex) {
-                int firstIndex = lastIndex;
-                lastIndex = breakIterator.next();
-
-                // Get the current word
-                if (lastIndex != BreakIterator.DONE && Character.isLetterOrDigit(string.charAt(firstIndex))) {
-                    String word = string.substring(firstIndex, lastIndex);
-                    wordsFound.add(word);
-                }
+            while( line.length() > string.length() ) {
+                if( !line.contains(string) ) // First see if the string is in here
+                    break;
+                
+                int indexOfWord = line.indexOf(string);
+                StringLocation location = new StringLocation(indexOfWord, text.lineNumber);
+                locations.add(location);
+                line = line.substring(indexOfWord+string.length());
             }
 
-            return wordsFound.toArray(new String[wordsFound.size()]);
+            return locations;
         }
-
     }
 
 }
